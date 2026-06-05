@@ -1,0 +1,101 @@
+name: Build unlocked IINA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - develop
+    paths:
+      - .github/workflows/build-unlocked-iina.yml
+
+jobs:
+  build:
+    name: Build modified IINA
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Patch window aspect behavior
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          main = Path("iina/MainWindowController.swift")
+          s = main.read_text(encoding="utf-8")
+
+          old_current = '''  private var currentWindowAspectRatio: NSSize {
+            guard let window else { return .zero }
+            return Preference.bool(for: .unlockWindowAspectRatio) ? window.frame.size : window.aspectRatio
+          }'''
+          new_current = '''  private var currentWindowAspectRatio: NSSize {
+            guard let window else { return .zero }
+            return window.frame.size
+          }'''
+
+          old_setter = '''  private func setWindowAspectRatio(_ aspectRatio: NSSize) {
+            guard let window else { return }
+            if Preference.bool(for: .unlockWindowAspectRatio) {
+              window.aspectRatio = .zero
+              window.resizeIncrements = .init(width: 1, height: 1)
+            } else {
+              window.aspectRatio = aspectRatio
+            }
+          }'''
+          new_setter = '''  private func setWindowAspectRatio(_ aspectRatio: NSSize) {
+            _ = aspectRatio
+            guard let window else { return }
+
+            // Custom build: always allow free window resizing.
+            // The video view keeps the movie aspect ratio; extra space is black padding.
+            window.aspectRatio = .zero
+            window.resizeIncrements = .init(width: 1, height: 1)
+          }'''
+
+          for old, new, label in [
+              (old_current, new_current, "currentWindowAspectRatio"),
+              (old_setter, new_setter, "setWindowAspectRatio"),
+          ]:
+              if old not in s:
+                  raise SystemExit(f"Patch target not found: {label}")
+              s = s.replace(old, new, 1)
+
+          main.write_text(s, encoding="utf-8")
+
+          pref = Path("iina/Preference.swift")
+          p = pref.read_text(encoding="utf-8")
+          p = p.replace(".unlockWindowAspectRatio: false,", ".unlockWindowAspectRatio: true,", 1)
+          p = p.replace(".resizeWindowTiming: ResizeWindowTiming.onlyWhenOpen.rawValue,", ".resizeWindowTiming: ResizeWindowTiming.never.rawValue,", 1)
+          pref.write_text(p, encoding="utf-8")
+          PY
+
+          git diff -- iina/MainWindowController.swift iina/Preference.swift
+
+      - name: Download precompiled libraries
+        shell: bash
+        run: ./other/download_libs.sh --arch universal
+
+      - name: Build IINA
+        shell: bash
+        run: |
+          xcodebuild \
+            -project iina.xcodeproj \
+            -scheme IINA \
+            -configuration Release \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+
+      - name: Package app
+        shell: bash
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent "build/Build/Products/Release/IINA.app" "IINA-unlocked-window-aspect.zip"
+
+      - name: Upload app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: IINA-unlocked-window-aspect
+          path: IINA-unlocked-window-aspect.zip
